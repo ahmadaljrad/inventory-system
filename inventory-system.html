@@ -1,0 +1,1254 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>ThreadStock — Inventory System</title>
+
+<!-- Parse JS SDK from Back4App -->
+<script src="https://unpkg.com/parse/dist/parse.min.js"></script>
+<script>
+// ── BACK4APP / PARSE CONFIG ───────────────────────────────────────────
+// احصل على هذه القيم من Back4App: App Settings → Security & Keys
+Parse.initialize("E1BWBCGhH1KMmHqQ1PYYU3LhVv8wSBYqJT58Be8D", "TjSLuWYiXH5XNbofeVvD38YkfMb3ZFWplR7K6qo9");
+Parse.serverURL = "https://parseapi.back4app.com/";
+
+// Helper: Product class
+const Product = Parse.Object.extend("Product");
+
+// استبدال onSnapshot في فايربيز: سنستخدم استعلام دوري بسيط (polling) كل 5 ثواني
+let allProducts = [];
+let filteredProducts = [];
+let currentUser = { email: "demo@store.com" }; // بدون Auth حقيقية الآن
+let scannerInstance = null;
+let isScannerRunning = false;
+let pendingImageBlob = null;
+let editingProductId = null;
+
+async function loadProductsOnce() {
+  const query = new Parse.Query(Product);
+  query.descending("createdAt");
+  const results = await query.find();
+  allProducts = results.map(p => ({
+    id: p.id,
+    name: p.get("name"),
+    price: p.get("price") || 0,
+    quantity: p.get("quantity") || 0,
+    barcode: p.get("barcode") || "",
+    imageUrl: p.get("imageUrl") || "",
+    createdAt: { seconds: Math.floor((p.createdAt || new Date()).getTime() / 1000) }
+  }));
+  updateDashboard();
+  applyFilters();
+}
+
+function startProductsPolling() {
+  loadProductsOnce();
+  setInterval(loadProductsOnce, 5000);
+}
+
+// ─────────────────────────────────────────────────────────
+// AUTH (مبسّط بدون Back4App Auth، فقط إخفاء شاشة اللوجين)
+// ─────────────────────────────────────────────────────────
+document.addEventListener("DOMContentLoaded", () => {
+  // اعتبر المستخدم دائماً مسجّل دخول
+  document.getElementById("auth-screen").style.display = "none";
+  const email = currentUser.email;
+  document.getElementById("userName").textContent = email.split("@")[0];
+  document.getElementById("userAvatar").textContent = email[0].toUpperCase();
+  initApp();
+});
+
+function doLogin() {
+  // لو حاب تضيف Auth Parse لاحقاً نربطه هنا
+  alert("Demo mode: login is disabled. You are already logged in.");
+}
+function doLogout() {
+  alert("Demo mode: logout is disabled.");
+}
+
+// ─────────────────────────────────────────────────────────
+// INIT
+// ─────────────────────────────────────────────────────────
+function initApp() {
+  startProductsPolling();
+}
+
+// ─────────────────────────────────────────────────────────
+// NAVIGATION
+// ─────────────────────────────────────────────────────────
+function navigate(page) {
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+
+  document.getElementById('page-' + page).classList.add('active');
+  document.querySelectorAll('.nav-item').forEach(n => {
+    if (n.getAttribute('onclick')?.includes(page)) n.classList.add('active');
+  });
+
+  document.getElementById('pageTitle').textContent = {
+    dashboard: 'Dashboard',
+    products:  'Products',
+    scanner:   'Barcode Scanner'
+  }[page];
+
+  const searchWrap = document.getElementById('searchWrap');
+  const addBtn     = document.getElementById('addBtn');
+  if (page === 'products') {
+    searchWrap.style.display = 'flex';
+    addBtn.style.display = 'flex';
+  } else {
+    searchWrap.style.display = 'none';
+    addBtn.style.display = 'none';
+  }
+
+  if (page !== 'scanner' && isScannerRunning) stopScanner();
+  closeSidebar();
+}
+
+function openSidebar()  { document.getElementById('sidebar').classList.add('open'); document.getElementById('sidebarBackdrop').classList.add('open'); }
+function closeSidebar() { document.getElementById('sidebar').classList.remove('open'); document.getElementById('sidebarBackdrop').classList.remove('open'); }
+
+// ─────────────────────────────────────────────────────────
+// DASHBOARD
+// ─────────────────────────────────────────────────────────
+function updateDashboard() {
+  const total    = allProducts.length;
+  const units    = allProducts.reduce((a, p) => a + (p.quantity || 0), 0);
+  const lowStock = allProducts.filter(p => p.quantity > 0 && p.quantity <= 5);
+  const outStock = allProducts.filter(p => p.quantity === 0 || p.quantity == null);
+
+  document.getElementById('statTotal').textContent = total;
+  document.getElementById('statUnits').textContent = units;
+  document.getElementById('statLow').textContent   = lowStock.length;
+  document.getElementById('statOut').textContent   = outStock.length;
+
+  // Recent products (last 5)
+  const recent = allProducts.slice(0, 5);
+  const recentEl = document.getElementById('recentProducts');
+  if (!recent.length) {
+    recentEl.innerHTML = `<div class="empty-state" style="padding:20px 0"><div class="empty-state-icon">📦</div><h3>No products yet</h3></div>`;
+  } else {
+    recentEl.innerHTML = `<table class="product-table">
+      <thead><tr><th></th><th>Name</th><th>Price</th><th>Qty</th></tr></thead>
+      <tbody>${recent.map(p => `
+        <tr style="cursor:pointer" onclick="openDetailModal('${p.id}')">
+          <td>${p.imageUrl ? `<img class="table-img" src="${p.imageUrl}" loading="lazy">` : `<div class="table-img" style="display:flex;align-items:center;justify-content:center;font-size:18px">👕</div>`}</td>
+          <td style="font-weight:600">${escHtml(p.name)}</td>
+          <td style="font-family:var(--font-m)">$${parseFloat(p.price||0).toFixed(2)}</td>
+          <td><span class="stock-badge ${stockClass(p.quantity)}">${p.quantity}</span></td>
+        </tr>`).join('')}
+      </tbody>
+    </table>`;
+  }
+
+  // Alerts
+  const alerts = allProducts.filter(p => (p.quantity || 0) <= 5).sort((a, b) => (a.quantity||0) - (b.quantity||0));
+  document.getElementById('alertCount').textContent = alerts.length;
+  const alertsEl = document.getElementById('stockAlerts');
+  if (!alerts.length) {
+    alertsEl.innerHTML = `<div class="empty-state" style="padding:20px 0"><div class="empty-state-icon">✅</div><h3>All stocked up!</h3></div>`;
+  } else {
+    alertsEl.innerHTML = alerts.map(p => `
+      <div class="alert-item ${p.quantity === 0 ? 'critical' : ''}" onclick="openDetailModal('${p.id}')" style="cursor:pointer">
+        <div class="alert-dot"></div>
+        <div class="alert-info">
+          <div class="alert-name">${escHtml(p.name)}</div>
+          <div class="alert-qty">${p.quantity === 0 ? '⚠️ Out of stock' : `Only ${p.quantity} left`}</div>
+        </div>
+        <span class="stock-badge ${stockClass(p.quantity)}">${p.quantity}</span>
+      </div>`).join('');
+  }
+}
+
+// ─────────────────────────────────────────────────────────
+// PRODUCTS LIST
+// ─────────────────────────────────────────────────────────
+function applyFilters() {
+  const search    = (document.getElementById('searchInput')?.value || '').toLowerCase();
+  const stockFilt = document.getElementById('stockFilter')?.value || 'all';
+  const sortFilt  = document.getElementById('sortFilter')?.value  || 'newest';
+
+  let list = [...allProducts];
+
+  if (search) {
+    list = list.filter(p =>
+      p.name?.toLowerCase().includes(search) ||
+      p.barcode?.toLowerCase().includes(search)
+    );
+  }
+
+  if (stockFilt === 'ok')  list = list.filter(p => (p.quantity||0) > 5);
+  if (stockFilt === 'low') list = list.filter(p => (p.quantity||0) > 0 && (p.quantity||0) <= 5);
+  if (stockFilt === 'out') list = list.filter(p => (p.quantity||0) === 0);
+
+  if (sortFilt === 'newest')     list.sort((a,b) => (b.createdAt?.seconds||0) - (a.createdAt?.seconds||0));
+  if (sortFilt === 'oldest')     list.sort((a,b) => (a.createdAt?.seconds||0) - (b.createdAt?.seconds||0));
+  if (sortFilt === 'name')       list.sort((a,b) => (a.name||'').localeCompare(b.name||''));
+  if (sortFilt === 'price-asc')  list.sort((a,b) => (a.price||0) - (b.price||0));
+  if (sortFilt === 'price-desc') list.sort((a,b) => (b.price||0) - (a.price||0));
+
+  filteredProducts = list;
+  renderProductsGrid();
+}
+
+function handleSearch() { applyFilters(); }
+
+function renderProductsGrid() {
+  const grid = document.getElementById('productsGrid');
+  if (!filteredProducts.length) {
+    grid.innerHTML = `<div class="empty-state" style="grid-column:1/-1">
+      <div class="empty-state-icon">🔍</div>
+      <h3>No products found</h3>
+      <p style="font-size:13px;margin-top:6px">Try adjusting your filters</p>
+    </div>`;
+    return;
+  }
+  grid.innerHTML = filteredProducts.map(p => `
+    <div class="product-card" onclick="openDetailModal('${p.id}')">
+      ${p.imageUrl
+        ? `<img class="product-img" src="${p.imageUrl}" loading="lazy" alt="${escHtml(p.name)}">`
+        : `<div class="product-img-placeholder">👕</div>`}
+      <div class="product-info">
+        <div class="product-name">${escHtml(p.name)}</div>
+        <div class="product-price">$${parseFloat(p.price||0).toFixed(2)}</div>
+        <div class="product-meta">
+          <span class="stock-badge ${stockClass(p.quantity)}">${stockLabel(p.quantity)}</span>
+          <span class="product-barcode-mini">#${(p.barcode||'').slice(-6)}</span>
+        </div>
+      </div>
+    </div>`).join('');
+}
+
+// ─────────────────────────────────────────────────────────
+// PRODUCT MODAL (Add / Edit)
+// ─────────────────────────────────────────────────────────
+function openProductModal(productData) {
+  pendingImageBlob = null;
+  editingProductId = null;
+
+  document.getElementById('editId').value       = '';
+  document.getElementById('editBarcode').value  = '';
+  document.getElementById('editImageUrl').value = '';
+  document.getElementById('editOldImagePath').value = '';
+  document.getElementById('prodName').value  = '';
+  document.getElementById('prodPrice').value = '';
+  document.getElementById('prodQty').value   = '';
+  document.getElementById('imgPreview').style.display = 'none';
+  document.getElementById('imgPlaceholder').style.display = 'block';
+  document.getElementById('imgUploadArea').classList.remove('has-img');
+
+  if (productData) {
+    document.getElementById('modalTitle').textContent = 'Edit Product';
+    document.getElementById('saveBtnText').textContent = 'Update Product';
+    editingProductId = productData.id;
+    document.getElementById('editId').value       = productData.id;
+    document.getElementById('editBarcode').value  = productData.barcode || '';
+    document.getElementById('editImageUrl').value = productData.imageUrl || '';
+    document.getElementById('prodName').value  = productData.name  || '';
+    document.getElementById('prodPrice').value = productData.price || '';
+    document.getElementById('prodQty').value   = productData.quantity ?? '';
+    if (productData.imageUrl) {
+      const prev = document.getElementById('imgPreview');
+      prev.src = productData.imageUrl;
+      prev.style.display = 'block';
+      document.getElementById('imgPlaceholder').style.display = 'none';
+      document.getElementById('imgUploadArea').classList.add('has-img');
+    }
+    renderBarcodePreview(productData.barcode);
+  } else {
+    document.getElementById('modalTitle').textContent = 'Add Product';
+    document.getElementById('saveBtnText').textContent = 'Save Product';
+    const newBarcode = generateBarcode();
+    document.getElementById('editBarcode').value = newBarcode;
+    renderBarcodePreview(newBarcode);
+  }
+
+  document.getElementById('productModal').classList.add('open');
+}
+
+function closeProductModal() {
+  document.getElementById('productModal').classList.remove('open');
+  pendingImageBlob = null;
+  editingProductId = null;
+}
+
+function renderBarcodePreview(code) {
+  try {
+    JsBarcode('#barcodePreviewSvg', code, {
+      format:'CODE128', width:1.5, height:50,
+      displayValue:false, background:'transparent',
+      lineColor:'#f0ede8'
+    });
+    document.getElementById('barcodeVal').textContent = code;
+  } catch(e) {}
+}
+
+function generateBarcode() {
+  const ts   = Date.now().toString();
+  const rand = Math.random().toString(36).substring(2, 7).toUpperCase();
+  return 'TS' + ts.slice(-8) + rand;
+}
+
+// ─────────────────────────────────────────────────────────
+// IMAGE HANDLING (بدون رفع حقيقي، سنخزن فقط data URL في Parse)
+// ─────────────────────────────────────────────────────────
+function triggerImgSelect()  { document.getElementById('fileInput').click(); }
+function triggerCamera()     { document.getElementById('cameraInput').click(); }
+
+document.addEventListener("DOMContentLoaded", () => {
+  document.getElementById('fileInput').addEventListener('change',   e => handleImageFile(e.target.files[0]));
+  document.getElementById('cameraInput').addEventListener('change', e => handleImageFile(e.target.files[0]));
+});
+
+function handleImageFile(file) {
+  if (!file) return;
+  compressImage(file, 800, 0.75, blob => {
+    pendingImageBlob = blob;
+    const url = URL.createObjectURL(blob);
+    const prev = document.getElementById('imgPreview');
+    prev.src = url;
+    prev.style.display = 'block';
+    document.getElementById('imgPlaceholder').style.display = 'none';
+    document.getElementById('imgUploadArea').classList.add('has-img');
+  });
+}
+
+function compressImage(file, maxSize, quality, cb) {
+  const canvas = document.createElement('canvas');
+  const img    = new Image();
+  const url    = URL.createObjectURL(file);
+  img.onload = () => {
+    let { width, height } = img;
+    if (width > height && width > maxSize) { height = height * maxSize / width; width = maxSize; }
+    else if (height > width && height > maxSize) { width = width * maxSize / height; height = maxSize; }
+    canvas.width = width; canvas.height = height;
+    canvas.getContext('2d').drawImage(img, 0, 0, width, height);
+    canvas.toBlob(blob => cb(blob), 'image/jpeg', quality);
+    URL.revokeObjectURL(url);
+  };
+  img.src = url;
+}
+
+// بديل بسيط لـ uploadImage: نخزن الصورة كـ Base64 في حقل imageUrl (للديمو)
+function blobToDataUrl(blob) {
+  return new Promise(resolve => {
+    const reader = new FileReader();
+    reader.onloadend = () => resolve(reader.result);
+    reader.readAsDataURL(blob);
+  });
+}
+
+// ─────────────────────────────────────────────────────────
+// SAVE PRODUCT (Parse)
+// ─────────────────────────────────────────────────────────
+async function saveProduct() {
+  const name     = document.getElementById('prodName').value.trim();
+  const price    = parseFloat(document.getElementById('prodPrice').value);
+  const quantity = parseInt(document.getElementById('prodQty').value);
+  const barcode  = document.getElementById('editBarcode').value;
+  const id       = document.getElementById('editId').value;
+  let imageUrl   = document.getElementById('editImageUrl').value;
+
+  if (!name)           { showToast('Product name is required', 'error'); return; }
+  if (isNaN(price))    { showToast('Enter a valid price', 'error'); return; }
+  if (isNaN(quantity)) { showToast('Enter a valid quantity', 'error'); return; }
+
+  setSaveLoading(true);
+
+  try {
+    let productObj;
+    if (id) {
+      const query = new Parse.Query(Product);
+      productObj = await query.get(id);
+    } else {
+      productObj = new Product();
+    }
+
+    if (pendingImageBlob) {
+      imageUrl = await blobToDataUrl(pendingImageBlob);
+    }
+
+    productObj.set("name", name);
+    productObj.set("price", price);
+    productObj.set("quantity", quantity);
+    productObj.set("barcode", barcode);
+    productObj.set("imageUrl", imageUrl || "");
+
+    await productObj.save();
+
+    showToast(id ? 'Product updated ✓' : 'Product added ✓', 'success');
+    closeProductModal();
+    if (document.getElementById('detailModal').classList.contains('open')) closeDetailModal();
+    await loadProductsOnce();
+  } catch(e) {
+    console.error(e);
+    showToast('Error: ' + e.message, 'error');
+  } finally {
+    setSaveLoading(false);
+  }
+}
+
+function setSaveLoading(on) {
+  document.getElementById('saveSpinner').style.display = on ? 'inline-block' : 'none';
+  document.getElementById('saveBtnText').style.opacity = on ? '0.5' : '1';
+  document.getElementById('saveBtn').disabled = on;
+}
+
+async function deleteProduct(productId) {
+  if (!confirm('Delete this product? This cannot be undone.')) return;
+  try {
+    const query = new Parse.Query(Product);
+    const obj = await query.get(productId);
+    await obj.destroy();
+    closeDetailModal();
+    showToast('Product deleted', 'info');
+    await loadProductsOnce();
+  } catch(e) {
+    console.error(e);
+    showToast('Error deleting product', 'error');
+  }
+}
+
+// ─────────────────────────────────────────────────────────
+// DETAIL MODAL
+// ─────────────────────────────────────────────────────────
+function openDetailModal(productId) {
+  const p = allProducts.find(x => x.id === productId);
+  if (!p) return;
+
+  const date = p.createdAt?.seconds
+    ? new Date(p.createdAt.seconds * 1000).toLocaleDateString('en-US', { year:'numeric', month:'short', day:'numeric' })
+    : '—';
+
+  const svgId = 'detailBarcodeSvg';
+
+  document.getElementById('detailBody').innerHTML = `
+    ${p.imageUrl ? `<img class="detail-img" src="${p.imageUrl}" loading="lazy">` : `<div class="detail-img" style="background:var(--surface);display:flex;align-items:center;justify-content:center;font-size:72px;border-radius:12px;margin-bottom:16px">👕</div>`}
+    <div class="detail-grid">
+      <div class="detail-field"><label>Name</label><value>${escHtml(p.name)}</value></div>
+      <div class="detail-field"><label>Price</label><value style="color:var(--accent);font-family:var(--font-m)">$${parseFloat(p.price||0).toFixed(2)}</value></div>
+      <div class="detail-field"><label>Status</label><value><span class="stock-badge ${stockClass(p.quantity)}">${stockLabel(p.quantity)}</span></value></div>
+      <div class="detail-field"><label>Created</label><value style="font-size:13px">${date}</value></div>
+    </div>
+    <div class="detail-qty-row">
+      <button class="qty-btn" onclick="updateQty('${p.id}', ${(p.quantity||0) - 1})">−</button>
+      <span class="qty-value">${p.quantity ?? 0}</span>
+      <button class="qty-btn" onclick="updateQty('${p.id}', ${(p.quantity||0) + 1})">+</button>
+      <span style="font-size:13px;color:var(--muted);margin-left:6px">units in stock</span>
+    </div>
+    <div class="barcode-display" style="margin-top:0">
+      <svg id="${svgId}"></svg>
+      <div class="barcode-val">${p.barcode}</div>
+    </div>
+    <div class="detail-actions">
+      <button class="btn btn-primary" onclick="editFromDetail('${p.id}')">
+        Edit
+      </button>
+      <button class="btn btn-danger" onclick="deleteProduct('${p.id}')">
+        Delete
+      </button>
+      <button class="btn btn-ghost" onclick="closeDetailModal()">Close</button>
+    </div>`;
+
+  document.getElementById('detailModal').classList.add('open');
+
+  setTimeout(() => {
+    try {
+      JsBarcode('#' + svgId, p.barcode, {
+        format:'CODE128', width:1.5, height:50,
+        displayValue:false, background:'transparent',
+        lineColor:'#f0ede8'
+      });
+    } catch(e) {}
+  }, 50);
+}
+
+function closeDetailModal() {
+  document.getElementById('detailModal').classList.remove('open');
+}
+
+function editFromDetail(productId) {
+  const p = allProducts.find(x => x.id === productId);
+  if (!p) return;
+  closeDetailModal();
+  openProductModal(p);
+}
+
+async function updateQty(productId, newQty) {
+  if (newQty < 0) return;
+  try {
+    const query = new Parse.Query(Product);
+    const obj = await query.get(productId);
+    obj.set("quantity", newQty);
+    await obj.save();
+    await loadProductsOnce();
+    openDetailModal(productId);
+  } catch(e) {
+    console.error(e);
+    showToast('Error updating quantity', 'error');
+  }
+}
+
+// ─────────────────────────────────────────────────────────
+// BARCODE SCANNER
+// ─────────────────────────────────────────────────────────
+async function startScanner() {
+  if (isScannerRunning) { await stopScanner(); await new Promise(r => setTimeout(r, 600)); }
+  try {
+    scannerInstance = new Html5Qrcode('reader');
+    await scannerInstance.start(
+      { facingMode: 'environment' },
+      { fps: 10, qrbox: { width: 260, height: 100 } },
+      onBarcodeDetected,
+      () => {}
+    );
+    isScannerRunning = true;
+    setScannerStatus('🎥 Camera active — scan a barcode', '');
+  } catch(e) {
+    setScannerStatus('❌ Camera access denied or unavailable', 'error');
+  }
+}
+
+async function stopScanner() {
+  if (scannerInstance && isScannerRunning) {
+    try { await scannerInstance.stop(); } catch(e) {}
+    isScannerRunning = false;
+  }
+  setScannerStatus('Scanner stopped', '');
+}
+
+function onBarcodeDetected(code) {
+  setScannerStatus('✅ Detected: ' + code, 'found');
+  lookupBarcode(code);
+}
+
+function lookupManual() {
+  const code = document.getElementById('manualBarcode').value.trim();
+  if (!code) { showToast('Enter a barcode value', 'error'); return; }
+  lookupBarcode(code);
+}
+
+function lookupBarcode(code) {
+  const product = allProducts.find(p => p.barcode === code);
+  if (product) {
+    setScannerStatus('✅ Product found: ' + product.name, 'found');
+    openDetailModal(product.id);
+    if (isScannerRunning) stopScanner();
+  } else {
+    setScannerStatus('❌ No product found for barcode: ' + code, 'error');
+    showToast('Product not found for barcode: ' + code, 'error');
+  }
+}
+
+function setScannerStatus(text, type) {
+  const el = document.getElementById('scannerStatus');
+  el.textContent = text;
+  el.className = 'scanner-status ' + (type || '');
+}
+
+// ─────────────────────────────────────────────────────────
+// UTILITIES + TOAST
+// ─────────────────────────────────────────────────────────
+function stockClass(qty) {
+  if (qty === 0 || qty == null) return 'stock-out';
+  if (qty <= 5) return 'stock-low';
+  return 'stock-ok';
+}
+function stockLabel(qty) {
+  if (qty === 0 || qty == null) return 'Out of stock';
+  if (qty <= 5) return qty + ' left';
+  return qty + ' in stock';
+}
+function escHtml(str) {
+  return String(str || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\"/g,'&quot;');
+}
+
+function showToast(msg, type = 'info') {
+  const c  = document.getElementById('toast-container');
+  const el = document.createElement('div');
+  el.className = 'toast ' + type;
+  const icon = { success: '✓', error: '✗', info: 'ℹ' }[type] || '';
+  el.innerHTML = `<span style="font-size:16px">${icon}</span><span>${msg}</span>`;
+  c.appendChild(el);
+  setTimeout(() => { el.style.opacity='0'; el.style.transform='translateX(20px)'; el.style.transition='.2s'; setTimeout(() => el.remove(), 200); }, 3000);
+}
+</script>
+
+<!-- JsBarcode -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jsbarcode/3.11.6/JsBarcode.all.min.js"></script>
+<!-- Html5-QRCode -->
+<script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Sans:wght@300;400;500;600&family=DM+Mono:wght@400;500&display=swap');
+
+/* ─── TOKENS ──────────────────────────────────────────── */
+:root {
+  --bg:       #0e0f11;
+  --surface:  #16181c;
+  --card:     #1c1f25;
+  --border:   #2a2d35;
+  --accent:   #f0c040;
+  --accent2:  #e05c3a;
+  --text:     #f0ede8;
+  --muted:    #8a8f9e;
+  --green:    #3ecf70;
+  --red:      #e05c3a;
+  --radius:   14px;
+  --nav-w:    220px;
+  --font-h:   'Bebas Neue', sans-serif;
+  --font-b:   'DM Sans', sans-serif;
+  --font-m:   'DM Mono', monospace;
+}
+
+/* ─── RESET ───────────────────────────────────────────── */
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;overflow:hidden}
+body{font-family:var(--font-b);background:var(--bg);color:var(--text);font-size:15px;-webkit-tap-highlight-color:transparent}
+button{cursor:pointer;border:none;outline:none;font-family:var(--font-b)}
+input,select,textarea{font-family:var(--font-b);outline:none}
+img{display:block;max-width:100%}
+svg{flex-shrink:0}
+
+/* ─── LAYOUT ──────────────────────────────────────────── */
+#app{display:flex;height:100vh;overflow:hidden}
+
+/* ─── SIDEBAR ─────────────────────────────────────────── */
+#sidebar{
+  width:var(--nav-w);flex-shrink:0;
+  background:var(--surface);
+  border-right:1px solid var(--border);
+  display:flex;flex-direction:column;
+  padding:0 0 20px;
+  transition:transform .3s cubic-bezier(.4,0,.2,1);
+  z-index:100;
+}
+.logo{
+  padding:24px 20px 20px;
+  border-bottom:1px solid var(--border);
+  margin-bottom:12px;
+}
+.logo-mark{font-family:var(--font-h);font-size:26px;letter-spacing:1px;color:var(--accent);line-height:1}
+.logo-sub{font-size:10px;letter-spacing:3px;text-transform:uppercase;color:var(--muted);margin-top:2px}
+
+.nav-item{
+  display:flex;align-items:center;gap:12px;
+  padding:13px 20px;
+  color:var(--muted);font-size:14px;font-weight:500;
+  border-radius:0;cursor:pointer;
+  transition:all .18s;
+  border-left:3px solid transparent;
+}
+.nav-item:hover{color:var(--text);background:rgba(255,255,255,.04)}
+.nav-item.active{color:var(--accent);background:rgba(240,192,64,.07);border-left-color:var(--accent)}
+.nav-item svg{width:18px;height:18px}
+
+.sidebar-spacer{flex:1}
+.sidebar-user{
+  padding:14px 20px;border-top:1px solid var(--border);
+  display:flex;align-items:center;gap:10px;
+}
+.user-avatar{
+  width:32px;height:32px;border-radius:50%;
+  background:var(--accent);display:flex;align-items:center;justify-content:center;
+  font-weight:700;font-size:13px;color:#000;flex-shrink:0;
+}
+.user-info{flex:1;min-width:0}
+.user-name{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.user-role{font-size:11px;color:var(--muted)}
+.btn-logout{background:none;color:var(--muted);padding:4px;border-radius:6px;transition:.15s}
+.btn-logout:hover{color:var(--red);background:rgba(224,92,58,.1)}
+
+/* ─── MAIN ────────────────────────────────────────────── */
+#main{flex:1;display:flex;flex-direction:column;overflow:hidden;min-width:0}
+.topbar{
+  height:60px;flex-shrink:0;
+  background:var(--surface);border-bottom:1px solid var(--border);
+  display:flex;align-items:center;padding:0 24px;gap:16px;
+}
+.topbar-title{font-family:var(--font-h);font-size:22px;letter-spacing:.5px;flex:1}
+.topbar-actions{display:flex;gap:10px;align-items:center}
+
+.search-wrap{
+  position:relative;display:flex;align-items:center;
+}
+.search-wrap svg{position:absolute;left:12px;width:15px;height:15px;color:var(--muted);pointer-events:none}
+.search-input{
+  background:var(--card);border:1px solid var(--border);
+  color:var(--text);border-radius:10px;padding:9px 14px 9px 36px;
+  font-size:13px;width:220px;transition:.2s;
+}
+.search-input:focus{border-color:var(--accent);width:260px}
+.search-input::placeholder{color:var(--muted)}
+
+#content{flex:1;overflow-y:auto;padding:24px}
+#content::-webkit-scrollbar{width:4px}
+#content::-webkit-scrollbar-track{background:transparent}
+#content::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px}
+
+/* ─── PAGES ───────────────────────────────────────────── */
+.page{display:none;animation:fadeUp .25s ease}
+.page.active{display:block}
+@keyframes fadeUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+
+/* ─── BUTTONS ─────────────────────────────────────────── */
+.btn{
+  display:inline-flex;align-items:center;gap:8px;
+  padding:11px 20px;border-radius:10px;font-size:14px;font-weight:600;
+  transition:all .15s;white-space:nowrap;
+}
+.btn-primary{background:var(--accent);color:#000}
+.btn-primary:hover{background:#f5cc55;transform:translateY(-1px);box-shadow:0 4px 16px rgba(240,192,64,.3)}
+.btn-danger{background:rgba(224,92,58,.15);color:var(--red);border:1px solid rgba(224,92,58,.3)}
+.btn-danger:hover{background:rgba(224,92,58,.25)}
+.btn-ghost{background:rgba(255,255,255,.06);color:var(--text);border:1px solid var(--border)}
+.btn-ghost:hover{background:rgba(255,255,255,.1)}
+.btn-sm{padding:7px 14px;font-size:13px}
+.btn svg{width:16px;height:16px}
+
+/* ─── CARDS ───────────────────────────────────────────── */
+.card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:20px}
+
+/* ─── DASHBOARD ───────────────────────────────────────── */
+.stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:16px;margin-bottom:24px}
+.stat-card{
+  background:var(--card);border:1px solid var(--border);border-radius:var(--radius);
+  padding:20px;display:flex;flex-direction:column;gap:8px;
+  position:relative;overflow:hidden;
+}
+.stat-card::before{
+  content:'';position:absolute;top:-20px;right:-20px;
+  width:80px;height:80px;border-radius:50%;
+  opacity:.08;
+}
+.stat-card.yellow::before{background:var(--accent)}
+.stat-card.green::before{background:var(--green)}
+.stat-card.red::before{background:var(--red)}
+.stat-card.blue::before{background:#5b8df5}
+.stat-label{font-size:11px;letter-spacing:2px;text-transform:uppercase;color:var(--muted)}
+.stat-value{font-family:var(--font-h);font-size:42px;line-height:1;letter-spacing:1px}
+.stat-card.yellow .stat-value{color:var(--accent)}
+.stat-card.green .stat-value{color:var(--green)}
+.stat-card.red .stat-value{color:var(--red)}
+.stat-card.blue .stat-value{color:#5b8df5}
+.stat-sub{font-size:12px;color:var(--muted)}
+
+.dash-grid{display:grid;grid-template-columns:1fr 1fr;gap:20px}
+@media(max-width:900px){.dash-grid{grid-template-columns:1fr}}
+
+.section-title{font-family:var(--font-h);font-size:18px;letter-spacing:.5px;margin-bottom:14px;display:flex;align-items:center;gap:10px}
+.badge{
+  font-family:var(--font-b);font-size:11px;font-weight:700;
+  padding:3px 8px;border-radius:20px;letter-spacing:.3px;
+}
+.badge-red{background:rgba(224,92,58,.2);color:var(--red)}
+.badge-green{background:rgba(62,207,112,.15);color:var(--green)}
+.badge-yellow{background:rgba(240,192,64,.15);color:var(--accent)}
+
+/* ─── PRODUCT LIST ────────────────────────────────────── */
+.filters-row{display:flex;gap:10px;align-items:center;margin-bottom:20px;flex-wrap:wrap}
+.filter-select{
+  background:var(--card);border:1px solid var(--border);
+  color:var(--text);border-radius:10px;padding:9px 14px;font-size:13px;
+  appearance:none;cursor:pointer;
+}
+.filter-select option{background:var(--card)}
+
+.products-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:16px}
+.product-card{
+  background:var(--card);border:1px solid var(--border);
+  border-radius:var(--radius);overflow:hidden;
+  transition:all .2s;cursor:pointer;
+  display:flex;flex-direction:column;
+}
+.product-card:hover{border-color:rgba(240,192,64,.4);transform:translateY(-2px);box-shadow:0 8px 30px rgba(0,0,0,.3)}
+.product-img{
+  width:100%;aspect-ratio:1;object-fit:cover;background:var(--surface);
+  border-bottom:1px solid var(--border);
+}
+.product-img-placeholder{
+  width:100%;aspect-ratio:1;background:var(--surface);
+  display:flex;align-items:center;justify-content:center;
+  border-bottom:1px solid var(--border);
+  font-size:40px;color:var(--border);
+}
+.product-info{padding:14px;flex:1;display:flex;flex-direction:column;gap:6px}
+.product-name{font-weight:600;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.product-price{font-family:var(--font-m);font-size:15px;color:var(--accent)}
+.product-meta{display:flex;justify-content:space-between;align-items:center;margin-top:4px}
+.stock-badge{font-size:11px;font-weight:600;padding:3px 8px;border-radius:6px}
+.stock-ok{background:rgba(62,207,112,.15);color:var(--green)}
+.stock-low{background:rgba(240,192,64,.15);color:var(--accent)}
+.stock-out{background:rgba(224,92,58,.15);color:var(--red)}
+.product-barcode-mini{font-family:var(--font-m);font-size:10px;color:var(--muted)}
+
+/* ─── MODAL ───────────────────────────────────────────── */
+.modal-overlay{
+  position:fixed;inset:0;background:rgba(0,0,0,.7);
+  display:flex;align-items:center;justify-content:center;
+  z-index:1000;padding:16px;
+  opacity:0;visibility:hidden;transition:all .2s;
+  backdrop-filter:blur(4px);
+}
+.modal-overlay.open{opacity:1;visibility:visible}
+.modal{
+  background:var(--card);border:1px solid var(--border);
+  border-radius:18px;width:100%;max-width:540px;
+  max-height:90vh;overflow-y:auto;
+  transform:scale(.95) translateY(10px);
+  transition:transform .2s cubic-bezier(.34,1.4,.64,1);
+}
+.modal-overlay.open .modal{transform:scale(1) translateY(0)}
+.modal::-webkit-scrollbar{width:4px}
+.modal::-webkit-scrollbar-thumb{background:var(--border)}
+.modal-header{
+  padding:22px 24px 0;display:flex;align-items:center;justify-content:space-between;
+  position:sticky;top:0;background:var(--card);z-index:1;padding-bottom:16px;
+  border-bottom:1px solid var(--border);
+}
+.modal-title{font-family:var(--font-h);font-size:22px;letter-spacing:.5px}
+.modal-close{
+  width:34px;height:34px;border-radius:50%;
+  background:rgba(255,255,255,.06);color:var(--muted);
+  display:flex;align-items:center;justify-content:center;
+  font-size:18px;transition:.15s;
+}
+.modal-close:hover{background:rgba(224,92,58,.15);color:var(--red)}
+.modal-body{padding:22px 24px 24px;display:flex;flex-direction:column;gap:18px}
+
+/* ─── FORM ────────────────────────────────────────────── */
+.form-group{display:flex;flex-direction:column;gap:6px}
+.form-label{font-size:12px;font-weight:600;letter-spacing:1px;text-transform:uppercase;color:var(--muted)}
+.form-input{
+  background:var(--surface);border:1px solid var(--border);
+  color:var(--text);border-radius:10px;padding:12px 14px;
+  font-size:14px;transition:.2s;width:100%;
+}
+.form-input:focus{border-color:var(--accent);background:rgba(240,192,64,.04)}
+.form-input::placeholder{color:var(--muted)}
+.form-row{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+
+.img-upload-area{
+  border:2px dashed var(--border);border-radius:12px;
+  padding:24px;text-align:center;cursor:pointer;
+  transition:.2s;position:relative;overflow:hidden;
+  background:var(--surface);
+}
+.img-upload-area:hover{border-color:var(--accent);background:rgba(240,192,64,.03)}
+.img-upload-area.has-img{border-style:solid;padding:0}
+.img-preview{width:100%;max-height:200px;object-fit:cover;border-radius:10px}
+.img-upload-icon{font-size:32px;margin-bottom:8px}
+.img-upload-text{font-size:13px;color:var(--muted)}
+.img-upload-actions{display:flex;gap:8px;margin-top:10px;justify-content:center}
+#fileInput{display:none}
+
+.barcode-display{
+  background:var(--surface);border:1px solid var(--border);border-radius:10px;
+  padding:14px;text-align:center;
+}
+.barcode-display svg{max-width:100%;height:70px}
+.barcode-val{font-family:var(--font-m);font-size:12px;color:var(--muted);margin-top:6px}
+
+/* ─── PRODUCT DETAIL MODAL ────────────────────────────── */
+.detail-img{width:100%;max-height:260px;object-fit:cover;border-radius:12px;margin-bottom:16px}
+.detail-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:16px}
+.detail-field label{font-size:11px;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted);display:block;margin-bottom:4px}
+.detail-field value{font-size:16px;font-weight:600;display:block}
+.detail-field value.mono{font-family:var(--font-m);font-size:14px}
+.detail-actions{display:flex;gap:10px;flex-wrap:wrap}
+.detail-qty-row{display:flex;align-items:center;gap:10px;background:var(--surface);padding:14px;border-radius:12px;border:1px solid var(--border)}
+.qty-btn{width:36px;height:36px;border-radius:8px;background:var(--border);color:var(--text);font-size:18px;font-weight:700;display:flex;align-items:center;justify-content:center;transition:.15s}
+.qty-btn:hover{background:var(--accent);color:#000}
+.qty-value{font-family:var(--font-h);font-size:30px;min-width:50px;text-align:center}
+
+/* ─── SCANNER ─────────────────────────────────────────── */
+#scanner-view{
+  background:var(--card);border:1px solid var(--border);border-radius:var(--radius);
+  padding:24px;text-align:center;
+}
+#reader{width:100%;max-width:500px;margin:0 auto;border-radius:12px;overflow:hidden}
+.scanner-status{
+  margin-top:16px;padding:14px 20px;
+  border-radius:10px;background:var(--surface);
+  font-size:14px;color:var(--muted);
+}
+.scanner-status.found{background:rgba(62,207,112,.1);color:var(--green);border:1px solid rgba(62,207,112,.2)}
+.scanner-status.error{background:rgba(224,92,58,.1);color:var(--red)}
+
+/* ─── AUTH ────────────────────────────────────────────── */
+#auth-screen{
+  position:fixed;inset:0;background:var(--bg);
+  display:flex;align-items:center;justify-content:center;
+  z-index:9999;padding:20px;
+}
+.auth-box{
+  width:100%;max-width:380px;
+  background:var(--card);border:1px solid var(--border);
+  border-radius:20px;padding:36px 32px;
+}
+.auth-logo{font-family:var(--font-h);font-size:40px;letter-spacing:2px;color:var(--accent);margin-bottom:4px}
+.auth-tagline{font-size:13px;color:var(--muted);margin-bottom:32px}
+.auth-err{background:rgba(224,92,58,.1);color:var(--red);border:1px solid rgba(224,92,58,.2);border-radius:8px;padding:10px 14px;font-size:13px;margin-bottom:12px;display:none}
+
+/* ─── TOAST ───────────────────────────────────────────── */
+#toast-container{position:fixed;bottom:24px;right:24px;z-index:9999;display:flex;flex-direction:column;gap:8px}
+.toast{
+  background:var(--card);border:1px solid var(--border);
+  border-radius:10px;padding:12px 18px;font-size:13px;font-weight:500;
+  display:flex;align-items:center;gap:10px;
+  animation:slideIn .2s ease;min-width:220px;
+  box-shadow:0 4px 20px rgba(0,0,0,.4);
+}
+.toast.success{border-left:3px solid var(--green)}
+.toast.error{border-left:3px solid var(--red)}
+.toast.info{border-left:3px solid var(--accent)}
+@keyframes slideIn{from{opacity:0;transform:translateX(20px)}to{opacity:1;transform:translateX(0)}}
+
+/* ─── LOADING ─────────────────────────────────────────── */
+.spinner{
+  width:20px;height:20px;border:2px solid var(--border);
+  border-top-color:var(--accent);border-radius:50%;
+  animation:spin .6s linear infinite;display:inline-block;
+}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+.empty-state{
+  text-align:center;padding:60px 20px;
+  color:var(--muted);
+}
+.empty-state-icon{font-size:48px;margin-bottom:12px;opacity:.4}
+.empty-state h3{font-family:var(--font-h);font-size:22px;margin-bottom:6px;color:var(--text);opacity:.5}
+
+/* ─── MOBILE MENU TOGGLE ──────────────────────────────── */
+.menu-toggle{
+  display:none;background:var(--card);border:1px solid var(--border);
+  color:var(--text);border-radius:10px;padding:8px;
+  align-items:center;justify-content:center;
+}
+.sidebar-backdrop{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:99;backdrop-filter:blur(2px)}
+
+@media(max-width:768px){
+  #sidebar{position:fixed;top:0;left:0;bottom:0;transform:translateX(-100%)}
+  #sidebar.open{transform:translateX(0)}
+  .sidebar-backdrop.open{display:block}
+  .menu-toggle{display:flex}
+  .search-input{width:160px}
+  .search-input:focus{width:180px}
+  .products-grid{grid-template-columns:repeat(auto-fill,minmax(160px,1fr))}
+  .form-row{grid-template-columns:1fr}
+  .dash-grid{grid-template-columns:1fr}
+}
+
+/* ─── TABLE (recent products) ─────────────────────────── */
+.product-table{width:100%;border-collapse:collapse}
+.product-table th{font-size:11px;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted);text-align:left;padding:10px 12px;border-bottom:1px solid var(--border)}
+.product-table td{padding:12px 12px;border-bottom:1px solid rgba(255,255,255,.04);font-size:13px;vertical-align:middle}
+.product-table tr:last-child td{border-bottom:none}
+.product-table tr:hover td{background:rgba(255,255,255,.02)}
+.table-img{width:36px;height:36px;border-radius:8px;object-fit:cover;background:var(--surface)}
+
+/* ─── ALERT LIST ──────────────────────────────────────── */
+.alert-item{
+  display:flex;align-items:center;gap:14px;
+  padding:12px 14px;border-radius:10px;
+  background:rgba(240,192,64,.06);border:1px solid rgba(240,192,64,.15);
+  margin-bottom:8px;
+}
+.alert-item.critical{background:rgba(224,92,58,.06);border-color:rgba(224,92,58,.2)}
+.alert-dot{width:8px;height:8px;border-radius:50%;background:var(--accent);flex-shrink:0}
+.alert-item.critical .alert-dot{background:var(--red)}
+.alert-info{flex:1;min-width:0}
+.alert-name{font-weight:600;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.alert-qty{font-size:12px;color:var(--muted)}
+</style>
+</head>
+<body>
+
+<!-- AUTH SCREEN -->
+<div id="auth-screen">
+  <div class="auth-box">
+    <div class="auth-logo">THREAD<span style="color:var(--text)">STOCK</span></div>
+    <div class="auth-tagline">Clothing Inventory Management</div>
+    <div class="auth-err" id="authErr"></div>
+    <div class="form-group" style="margin-bottom:14px">
+      <label class="form-label">Email</label>
+      <input class="form-input" type="email" id="authEmail" placeholder="store@email.com">
+    </div>
+    <div class="form-group" style="margin-bottom:22px">
+      <label class="form-label">Password</label>
+      <input class="form-input" type="password" id="authPass" placeholder="••••••••">
+    </div>
+    <button class="btn btn-primary" style="width:100%;justify-content:center" onclick="doLogin()">
+      Sign In
+    </button>
+    <p style="text-align:center;margin-top:14px;font-size:12px;color:var(--muted)">
+      Demo: enable anonymous auth or add a test user in Firebase Console
+    </p>
+  </div>
+</div>
+
+<!-- TOAST CONTAINER -->
+<div id="toast-container"></div>
+
+<!-- SIDEBAR BACKDROP -->
+<div class="sidebar-backdrop" id="sidebarBackdrop" onclick="closeSidebar()"></div>
+
+<!-- APP -->
+<div id="app">
+  <!-- SIDEBAR -->
+  <nav id="sidebar">
+    <div class="logo">
+      <div class="logo-mark">THREAD<span style="color:var(--text)">STOCK</span></div>
+      <div class="logo-sub">Inventory System</div>
+    </div>
+
+    <div class="nav-item active" onclick="navigate('dashboard')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+      Dashboard
+    </div>
+    <div class="nav-item" onclick="navigate('products')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 2L3 6v14a2 2 0 002 2h14a2 2 0 002-2V6l-3-4z"/><line x1="3" y1="6" x2="21" y2="6"/><path d="M16 10a4 4 0 01-8 0"/></svg>
+      Products
+    </div>
+    <div class="nav-item" onclick="navigate('scanner')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 9V6a2 2 0 012-2h2"/><path d="M15 4h2a2 2 0 012 2v3"/><path d="M21 15v2a2 2 0 01-2 2h-2"/><path d="M9 20H7a2 2 0 01-2-2v-2"/><line x1="7" y1="12" x2="7" y2="12.01"/><line x1="10.5" y1="8" x2="10.5" y2="16"/><line x1="13.5" y1="8" x2="13.5" y2="16"/><line x1="17" y1="12" x2="17" y2="12.01"/></svg>
+      Scanner
+    </div>
+
+    <div class="sidebar-spacer"></div>
+    <div class="sidebar-user">
+      <div class="user-avatar" id="userAvatar">?</div>
+      <div class="user-info">
+        <div class="user-name" id="userName">User</div>
+        <div class="user-role">Store Manager</div>
+      </div>
+      <button class="btn-logout" onclick="doLogout()" title="Sign out">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+      </button>
+    </div>
+  </nav>
+
+  <!-- MAIN -->
+  <main id="main">
+    <!-- TOPBAR -->
+    <div class="topbar">
+      <button class="menu-toggle" onclick="openSidebar()">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
+      <div class="topbar-title" id="pageTitle">Dashboard</div>
+      <div class="topbar-actions">
+        <div class="search-wrap" id="searchWrap" style="display:none">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+          <input class="search-input" id="searchInput" placeholder="Search products…" oninput="handleSearch()">
+        </div>
+        <button class="btn btn-primary btn-sm" id="addBtn" onclick="openProductModal()" style="display:none">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="15" height="15"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+          Add Product
+        </button>
+      </div>
+    </div>
+
+    <!-- CONTENT -->
+    <div id="content">
+
+      <!-- DASHBOARD PAGE -->
+      <div class="page active" id="page-dashboard">
+        <div class="stats-grid" id="statsGrid">
+          <div class="stat-card yellow">
+            <div class="stat-label">Total Products</div>
+            <div class="stat-value" id="statTotal">–</div>
+            <div class="stat-sub">in catalog</div>
+          </div>
+          <div class="stat-card green">
+            <div class="stat-label">Total Units</div>
+            <div class="stat-value" id="statUnits">–</div>
+            <div class="stat-sub">in stock</div>
+          </div>
+          <div class="stat-card red">
+            <div class="stat-label">Low Stock</div>
+            <div class="stat-value" id="statLow">–</div>
+            <div class="stat-sub">items ≤ 5 units</div>
+          </div>
+          <div class="stat-card blue">
+            <div class="stat-label">Out of Stock</div>
+            <div class="stat-value" id="statOut">–</div>
+            <div class="stat-sub">need restocking</div>
+          </div>
+        </div>
+
+        <div class="dash-grid">
+          <div class="card">
+            <div class="section-title">
+              Recent Products
+            </div>
+            <div id="recentProducts">
+              <div class="empty-state" style="padding:30px 0">
+                <div class="spinner"></div>
+              </div>
+            </div>
+          </div>
+          <div class="card">
+            <div class="section-title">
+              Stock Alerts
+              <span class="badge badge-red" id="alertCount">0</span>
+            </div>
+            <div id="stockAlerts">
+              <div class="empty-state" style="padding:30px 0">
+                <div class="spinner"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- PRODUCTS PAGE -->
+      <div class="page" id="page-products">
+        <div class="filters-row">
+          <select class="filter-select" id="stockFilter" onchange="applyFilters()">
+            <option value="all">All Stock Levels</option>
+            <option value="ok">In Stock (>5)</option>
+            <option value="low">Low Stock (1-5)</option>
+            <option value="out">Out of Stock</option>
+          </select>
+          <select class="filter-select" id="sortFilter" onchange="applyFilters()">
+            <option value="newest">Newest First</option>
+            <option value="oldest">Oldest First</option>
+            <option value="name">Name A-Z</option>
+            <option value="price-asc">Price ↑</option>
+            <option value="price-desc">Price ↓</option>
+          </select>
+        </div>
+        <div class="products-grid" id="productsGrid">
+          <div style="grid-column:1/-1;text-align:center;padding:60px 0">
+            <div class="spinner"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- SCANNER PAGE -->
+      <div class="page" id="page-scanner">
+        <div id="scanner-view">
+          <div style="margin-bottom:16px">
+            <h2 style="font-family:var(--font-h);font-size:24px;letter-spacing:.5px;margin-bottom:4px">Barcode Scanner</h2>
+            <p style="color:var(--muted);font-size:13px">Point camera at a product barcode to look it up instantly</p>
+          </div>
+          <div id="reader"></div>
+          <div class="scanner-status" id="scannerStatus">Initializing camera…</div>
+          <div style="margin-top:16px;display:flex;gap:10px;justify-content:center;flex-wrap:wrap">
+            <button class="btn btn-primary" onclick="startScanner()">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M3 9V6a2 2 0 012-2h2"/><path d="M15 4h2a2 2 0 012 2v3"/><path d="M21 15v2a2 2 0 01-2 2h-2"/><path d="M9 20H7a2 2 0 01-2-2v-2"/></svg>
+              Start Scanner
+            </button>
+            <button class="btn btn-ghost" onclick="stopScanner()">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="6" y="6" width="12" height="12"/></svg>
+              Stop
+            </button>
+          </div>
+          <!-- Manual entry -->
+          <div style="margin-top:24px;border-top:1px solid var(--border);padding-top:20px">
+            <p style="font-size:12px;color:var(--muted);margin-bottom:10px;text-align:left">Or enter barcode manually:</p>
+            <div style="display:flex;gap:10px">
+              <input class="form-input" id="manualBarcode" placeholder="Enter barcode value…" style="flex:1">
+              <button class="btn btn-ghost" onclick="lookupManual()">Lookup</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div><!-- /content -->
+  </main>
+</div>
+
+<!-- PRODUCT FORM MODAL -->
+<div class="modal-overlay" id="productModal">
+  <div class="modal">
+    <div class="modal-header">
+      <div class="modal-title" id="modalTitle">Add Product</div>
+      <button class="modal-close" onclick="closeProductModal()">✕</button>
+    </div>
+    <div class="modal-body">
+      <input type="hidden" id="editId">
+      <input type="hidden" id="editBarcode">
+      <input type="hidden" id="editImageUrl">
+      <input type="hidden" id="editOldImagePath">
+
+      <!-- Image -->
+      <div class="form-group">
+        <label class="form-label">Product Image</label>
+        <div class="img-upload-area" id="imgUploadArea" onclick="triggerImgSelect()">
+          <div id="imgPlaceholder">
+            <div class="img-upload-icon">📷</div>
+            <div class="img-upload-text">Tap to select or capture image</div>
+            <div style="font-size:11px;color:var(--muted);margin-top:4px">Will be compressed before upload</div>
+          </div>
+          <img id="imgPreview" class="img-preview" style="display:none">
+        </div>
+        <div class="img-upload-actions">
+          <button class="btn btn-ghost btn-sm" type="button" onclick="triggerImgSelect()">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+            Gallery
+          </button>
+          <button class="btn btn-ghost btn-sm" type="button" onclick="triggerCamera()">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><path d="M23 19a2 2 0 01-2 2H3a2 2 0 01-2-2V8a2 2 0 012-2h4l2-3h6l2 3h4a2 2 0 012 2z"/><circle cx="12" cy="13" r="4"/></svg>
+            Camera
+          </button>
+        </div>
+        <input type="file" id="fileInput" accept="image/*">
+        <input type="file" id="cameraInput" accept="image/*" capture="environment">
+      </div>
+
+      <!-- Name -->
+      <div class="form-group">
+        <label class="form-label">Product Name *</label>
+        <input class="form-input" id="prodName" placeholder="e.g. Classic White T-Shirt">
+      </div>
+
+      <!-- Price & Qty -->
+      <div class="form-row">
+        <div class="form-group">
+          <label class="form-label">Price *</label>
+          <input class="form-input" id="prodPrice" type="number" min="0" step="0.01" placeholder="0.00">
+        </div>
+        <div class="form-group">
+          <label class="form-label">Quantity *</label>
+          <input class="form-input" id="prodQty" type="number" min="0" placeholder="0">
+        </div>
+      </div>
+
+      <!-- Barcode -->
+      <div class="form-group">
+        <label class="form-label">Barcode (auto-generated)</label>
+        <div class="barcode-display" id="barcodeDisplay">
+          <svg id="barcodePreviewSvg"></svg>
+          <div class="barcode-val" id="barcodeVal">–</div>
+        </div>
+      </div>
+
+      <!-- Actions -->
+      <div style="display:flex;gap:10px;justify-content:flex-end">
+        <button class="btn btn-ghost" onclick="closeProductModal()">Cancel</button>
+        <button class="btn btn-primary" onclick="saveProduct()" id="saveBtn">
+          <span id="saveBtnText">Save Product</span>
+          <span class="spinner" id="saveSpinner" style="display:none;width:14px;height:14px"></span>
+        </button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- PRODUCT DETAIL MODAL -->
+<div class="modal-overlay" id="detailModal">
+  <div class="modal">
+    <div class="modal-header">
+      <div class="modal-title">Product Details</div>
+      <button class="modal-close" onclick="closeDetailModal()">✕</button>
+    </div>
+    <div class="modal-body" id="detailBody">
+    </div>
+  </div>
+</div>
+
+
+</body>
+</html>
